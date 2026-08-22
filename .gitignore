@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# lms-mdm: never commit downloaded model data
+models/
+.mdm-test/
+*.mdm-part
