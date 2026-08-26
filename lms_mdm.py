@@ -20,6 +20,8 @@ import os
 import queue
 import random
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -29,6 +31,7 @@ import urllib.request
 DEFAULT_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 CANONICAL_ENDPOINT = "https://huggingface.co"
 DEFAULT_MODELS_DIR = os.path.expanduser("~/.lmstudio/models")
+INTERNAL_DIR = os.path.expanduser("~/.lmstudio/.internal")
 STATE_SUFFIX = ".mdm-state.json"
 PART_SUFFIX = ".mdm-part"
 LMS_PART_PREFIX = "downloading_"
@@ -37,6 +40,7 @@ CHUNK_READ = 512 * 1024
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 60
 MAX_ATTEMPTS = 10
+LMS_SETTLE_SECS = 1.0
 
 
 def human(n: float) -> str:
@@ -448,6 +452,239 @@ def verify_file(path: str, size: int, sha256: str | None) -> bool:
     return h.hexdigest() == sha256
 
 
+def prompt_yes_no(question: str, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        ans = input(f"{question} {suffix} ").strip().lower()
+    except EOFError:
+        return False
+    if not ans:
+        return default
+    return ans in ("y", "yes")
+
+
+def lms_running() -> bool:
+    try:
+        r = subprocess.run(["pgrep", "-f", "LM Studio.app"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+def _wait_lms_gone(seconds: float) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if not lms_running():
+            return True
+        time.sleep(0.4)
+    return not lms_running()
+
+
+def quit_lm_studio(timeout: float = 10.0) -> bool:
+    """Gracefully ask LM Studio to quit (same as the user choosing Quit).
+
+    Never sends signals: LM Studio may be mid-write to its job registries,
+    and killing it risks corrupting them."""
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(["osascript", "-e", 'quit app "LM Studio"'],
+                           check=False, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    return _wait_lms_gone(timeout)
+
+
+def force_kill_lms() -> bool:
+    """Last resort, only on explicit user consent: SIGTERM then SIGKILL."""
+    try:
+        subprocess.run(["pkill", "-TERM", "-f", "LM Studio.app"],
+                       check=False, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+    if _wait_lms_gone(8.0):
+        return True
+    print("  · still alive; sending SIGKILL")
+    try:
+        subprocess.run(["pkill", "-9", "-f", "LM Studio.app"],
+                       check=False, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+    return _wait_lms_gone(5.0)
+
+
+def _settle_after_exit() -> bool:
+    """After the last LM Studio process disappears, give it a moment so any
+    final disk flush completes, then re-verify it stayed down."""
+    time.sleep(LMS_SETTLE_SECS)
+    return not lms_running()
+
+
+def _atomic_write_json(path: str, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def _backup_file(path: str) -> str | None:
+    if not os.path.exists(path):
+        return None
+    base, ext = os.path.splitext(path)
+    dst = f"{base}_{time.strftime('%Y-%m-%d_%H_%M_%S')}{ext}"
+    shutil.copy2(path, dst)
+    return dst
+
+
+def _iter_downloads(job: dict):
+    for t in job.get("tasks") or []:
+        d = t.get("download")
+        if isinstance(d, dict):
+            yield d
+
+
+def cleanup_lms_job_records(dest_dir: str,
+                            internal_dir: str = INTERNAL_DIR) -> tuple[int, int, int, int]:
+    """Mark LM Studio's download-job records for dest_dir as completed so the
+    app indexes the folder instead of showing a phantom download.
+
+    Must only run while LM Studio is not running.
+    Returns (tasks, wrappers, moved, removed_parts)."""
+    prefix = dest_dir.rstrip(os.sep) + os.sep
+    if lms_running():
+        raise RuntimeError("LM Studio is still running; refusing to edit "
+                           "its job registries")
+    jobs_path = os.path.join(internal_dir, "download-jobs-info.json")
+    sd_path = os.path.join(internal_dir, "single-downloads-info.json")
+    if not os.path.exists(jobs_path) and not os.path.exists(sd_path):
+        raise FileNotFoundError(f"no LM Studio job registries in {internal_dir}")
+
+    for p in (jobs_path, sd_path):
+        b = _backup_file(p)
+        if b:
+            print(f"  ~ backup: {os.path.basename(b)}")
+
+    now_ms = int(time.time() * 1000)
+    tasks_done = wrappers_done = 0
+
+    if os.path.exists(jobs_path):
+        data = json.load(open(jobs_path))
+        jobs = data.get("jobs") if isinstance(data, dict) else data
+        for job in jobs if isinstance(jobs, list) else []:
+            if not isinstance(job, dict):
+                continue
+            ds = [d for d in _iter_downloads(job)
+                  if str(d.get("targetPath", "")).startswith(prefix)]
+            if not ds:
+                continue
+            for d in ds:
+                total = d.get("totalSizeBytes")
+                if total:
+                    d["downloadedSizeBytes"] = total
+                d["progress"] = 100
+                d["status"] = "completed"
+                d["errorMessage"] = None
+                if "autoRetryNextTimestamp" in d:
+                    d["autoRetryNextTimestamp"] = None
+                tasks_done += 1
+            js = job.get("jobState")
+            if not (isinstance(js, dict) and js.get("type") in ("completed", "ended")):
+                job["jobState"] = {"type": "completed",
+                                   "completedTimestamp": now_ms}
+                wrappers_done += 1
+        if tasks_done or wrappers_done:
+            _atomic_write_json(jobs_path, data)
+
+    moved = 0
+    if os.path.exists(sd_path):
+        sd = json.load(open(sd_path))
+        dm = sd.get("downloadsMap") or []
+        ed = sd.get("endedDownloadsMap")
+        if ed is None:
+            ed = []
+            sd["endedDownloadsMap"] = ed
+        keep = []
+        for pair in dm:
+            v = pair[1] if isinstance(pair, list) and len(pair) == 2 else None
+            if isinstance(v, dict) and str(v.get("targetPath", "")).startswith(prefix):
+                v["status"] = {"type": "ended", "endReason": "completed"}
+                if v.get("totalSizeBytes"):
+                    v["downloadedSizeBytes"] = v["totalSizeBytes"]
+                ed.append([pair[0], v])
+                moved += 1
+            else:
+                keep.append(pair)
+        if moved:
+            sd["downloadsMap"] = keep
+            _atomic_write_json(sd_path, sd)
+
+    removed_parts = 0
+    if os.path.isdir(dest_dir):
+        for name in os.listdir(dest_dir):
+            if name.startswith(LMS_PART_PREFIX) and name.endswith(".part"):
+                final_name = name[len(LMS_PART_PREFIX):-len(".part")]
+                if os.path.exists(os.path.join(dest_dir, final_name)):
+                    os.remove(os.path.join(dest_dir, name))
+                    removed_parts += 1
+
+    return tasks_done, wrappers_done, moved, removed_parts
+
+
+def run_job_cleanup(dest_dir: str, confirmed: bool = False,
+                    internal_dir: str = INTERNAL_DIR):
+    if not confirmed:
+        print("\nLM Studio must be closed while its download-job records are edited.")
+        if not prompt_yes_no("Quit LM Studio and clean up stale job records now?", True):
+            print("skipped: re-run later with --fix-lms-jobs (with LM Studio closed)")
+            return
+    if lms_running():
+        print("quitting LM Studio...")
+        if not quit_lm_studio():
+            print("  · the LM Studio menu-bar agent is still running "
+                  "(the window already closed).")
+            print("    Recommended: click its menu-bar icon and choose Quit — "
+                  "killing it risks corrupting LM Studio's databases.")
+            if not sys.stdin.isatty():
+                print("  ! non-interactive session; cleanup aborted. Close LM "
+                      "Studio fully (menu-bar icon too) and re-run.")
+                return
+            choice = input("    [q] I quit it myself   [f] force-terminate it   "
+                           "[a] abort: ").strip().lower()
+            if choice == "f":
+                print("forcing termination...")
+                if not force_kill_lms():
+                    print("  ! could not terminate LM Studio; cleanup aborted")
+                    return
+            elif choice == "q":
+                print("waiting for LM Studio to exit (up to 3 minutes)...")
+                if not _wait_lms_gone(180.0):
+                    print("  ! still running after 3 min; cleanup aborted. "
+                          "Re-run when fully closed.")
+                    return
+            else:
+                print("cleanup aborted")
+                return
+    if not _settle_after_exit():
+        print("  ! LM Studio started again unexpectedly; cleanup aborted")
+        return
+    try:
+        tasks, wrappers, moved, parts = cleanup_lms_job_records(dest_dir,
+                                                                internal_dir)
+    except FileNotFoundError as e:
+        print(f"  ! {e}")
+        return
+    except RuntimeError as e:
+        print(f"  ! {e}")
+        return
+    print(f"  ✓ marked {tasks} task(s)/{wrappers} job(s) completed, "
+          f"moved {moved} record(s), removed {parts} stray .part file(s)")
+    print("done. relaunch LM Studio; the model should appear in My Models.")
+    print("Final step: Open the model card again in LM Studio and click the 'Complete Download' button if it is present.")
+
+
 def main(argv=None):
     sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser(
@@ -480,6 +717,11 @@ def main(argv=None):
                     help="ignore saved segment state")
     ap.add_argument("--no-seed", action="store_true",
                     help="do not adopt LM Studio 'downloading_*.part' files")
+    ap.add_argument("--fix-lms-jobs", action="store_true",
+                    help="after downloading, quit LM Studio and mark its stale "
+                         "download-job records for this model as completed so "
+                         "the model is indexed (with a terminal attached, an "
+                         "interactive prompt is shown by default)")
     ap.add_argument("--list", action="store_true",
                     help="show remote files and local status, then exit")
     ap.add_argument("--dry-run", action="store_true",
@@ -572,6 +814,14 @@ def main(argv=None):
     speed = f" ({human(prog.done / max(elapsed, 0.001))}/s avg)" \
         if prog.done and elapsed > 0.5 else ""
     print(f"all {len(files)} file(s) ready in {fmt_eta(elapsed)}{speed}")
+
+    if args.fix_lms_jobs:
+        run_job_cleanup(dest_dir, confirmed=True)
+    elif not args.list and not args.dry_run and sys.stdin.isatty():
+        if prompt_yes_no(
+                "\nClean up stale LM Studio download jobs for this model now? "
+                "(quits LM Studio; makes it index the new model)"):
+            run_job_cleanup(dest_dir, confirmed=True)
     return 0
 
 
