@@ -2,6 +2,8 @@
 
 A zero-dependency, multi-threaded model download manager that fetches Hugging Face models directly into LM Studio's local model directory.
 
+Tested on LM Studio >= `0.4.21+2`.
+
 ## Background
 
 LM Studio downloads models over a **single HTTP connection**. On unstable networks this means:
@@ -145,3 +147,22 @@ Then relaunch LM Studio — verify with `lms ls`.
 - **Existing-file checks are size-only** — files already on disk are skipped by size match; their content isn't re-hashed (only freshly downloaded data gets sha256 verification).
 - **Gated repos** require `--token`/`$HF_TOKEN`.
 - **No rate limiting** — aggressive worker counts may trip CDN throttling; backoff handles transient 429s, but lower `--workers` if a host complains.
+
+## Development checks
+
+Install the development tools and enable the Git pre-commit hook after cloning:
+
+```bash
+python3 -m pip install pre-commit ruff
+pre-commit install
+```
+
+Each commit checks staged Python files for syntax errors and runs `ruff check`.
+The checks use `python3` and `ruff` from your PATH and block the commit on failure.
+They do not modify files. Downloads require no additional runtime dependencies.
+
+Run the checks manually across all tracked Python files:
+
+```bash
+pre-commit run --all-files
+```

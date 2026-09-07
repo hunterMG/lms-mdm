@@ -1,0 +1,14 @@
+repos:
+  - repo: local
+    hooks:
+      - id: python-syntax
+        name: Check Python syntax
+        language: system
+        entry: >-
+          python3 -c 'import pathlib, sys; [compile(pathlib.Path(p).read_bytes(), p, "exec") for p in sys.argv[1:]]'
+        types: [python]
+      - id: ruff
+        name: Ruff
+        language: system
+        entry: ruff check --no-cache
+        types: [python]

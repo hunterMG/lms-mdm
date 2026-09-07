@@ -52,7 +52,7 @@ def human(n: float) -> str:
 
 
 def fmt_eta(seconds: float) -> str:
-    if seconds <= 0 or seconds != seconds:
+    if seconds <= 0 or seconds != seconds:  # noqa: PLR0124 – NaN check
         return "--:--"
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
@@ -241,12 +241,11 @@ def resolve_download_host(client: HttpClient, repo: str, name: str, revision: st
     st = probe(preferred)
     if st == "206":
         return preferred, "segmented"
-    if preferred.rstrip("/") != CANONICAL_ENDPOINT:
-        if probe(CANONICAL_ENDPOINT) == "206":
-            prog.note(f"  ~ {preferred} does not honor byte ranges "
-                      f"(got {st or 'connection failed'}); using "
-                      f"{CANONICAL_ENDPOINT} for segmented download of {name}")
-            return CANONICAL_ENDPOINT, "segmented"
+    if preferred.rstrip("/") != CANONICAL_ENDPOINT and probe(CANONICAL_ENDPOINT) == "206":
+        prog.note(f"  ~ {preferred} does not honor byte ranges "
+                  f"(got {st or 'connection failed'}); using "
+                  f"{CANONICAL_ENDPOINT} for segmented download of {name}")
+        return CANONICAL_ENDPOINT, "segmented"
     prog.note(f"  ~ no range-capable host found ({preferred}: "
               f"{st or 'unreachable'}); single-stream fallback for {name}")
     return preferred, "single"
@@ -289,7 +288,7 @@ def download_single_stream(client: HttpClient, url: str, part: str, final: str,
                     prog.inflight += len(data)
     except KeyboardInterrupt:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 – catch-all for network/disk errors
         prog.note(f"  ! {name} single-stream failed: "
                   f"{type(e).__name__}: {e}; re-run to retry")
         return False
@@ -402,7 +401,7 @@ def download_file(client: HttpClient, repo: str, entry: dict, dest_dir: str, arg
                         save_state(state_path, url, size, seg_size, sha256,
                                    sorted(set(done)))
                     break
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 – retry on any transient error
                     if attempt == MAX_ATTEMPTS:
                         errors.append(f"segment {idx} [{start}-{end}] "
                                       f"after {MAX_ATTEMPTS} attempts: {e}")
@@ -465,7 +464,7 @@ def prompt_yes_no(question: str, default: bool = False) -> bool:
 
 def lms_running() -> bool:
     try:
-        r = subprocess.run(["pgrep", "-f", "LM Studio.app"],
+        r = subprocess.run(["pgrep", "-f", "LM Studio.app"], check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return r.returncode == 0
     except OSError:
@@ -571,7 +570,8 @@ def cleanup_lms_job_records(dest_dir: str,
     tasks_done = wrappers_done = 0
 
     if os.path.exists(jobs_path):
-        data = json.load(open(jobs_path))
+        with open(jobs_path) as f:
+            data = json.load(f)
         jobs = data.get("jobs") if isinstance(data, dict) else data
         for job in jobs if isinstance(jobs, list) else []:
             if not isinstance(job, dict):
@@ -600,7 +600,8 @@ def cleanup_lms_job_records(dest_dir: str,
 
     moved = 0
     if os.path.exists(sd_path):
-        sd = json.load(open(sd_path))
+        with open(sd_path) as f:
+            sd = json.load(f)
         dm = sd.get("downloadsMap") or []
         ed = sd.get("endedDownloadsMap")
         if ed is None:
@@ -686,7 +687,7 @@ def run_job_cleanup(dest_dir: str, confirmed: bool = False,
 
 
 def main(argv=None):
-    sys.stdout.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
     ap = argparse.ArgumentParser(
         prog="lms-mdm",
         description="Multi-threaded, resumable model downloader for LM Studio "
@@ -815,13 +816,13 @@ def main(argv=None):
         if prog.done and elapsed > 0.5 else ""
     print(f"all {len(files)} file(s) ready in {fmt_eta(elapsed)}{speed}")
 
-    if args.fix_lms_jobs:
+    if args.fix_lms_jobs:  # noqa: SIM114 – branches share body but have distinct intent
         run_job_cleanup(dest_dir, confirmed=True)
-    elif not args.list and not args.dry_run and sys.stdin.isatty():
-        if prompt_yes_no(
-                "\nClean up stale LM Studio download jobs for this model now? "
-                "(quits LM Studio; makes it index the new model)"):
-            run_job_cleanup(dest_dir, confirmed=True)
+    elif (not args.list and not args.dry_run and sys.stdin.isatty()
+          and prompt_yes_no(
+              "\nClean up stale LM Studio download jobs for this model now? "
+              "(quits LM Studio; makes it index the new model)")):
+        run_job_cleanup(dest_dir, confirmed=True)
     return 0
 
 
