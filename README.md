@@ -166,3 +166,8 @@ Run the checks manually across all tracked Python files:
 ```bash
 pre-commit run --all-files
 ```
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0.
+See [LICENSE](LICENSE) for the complete license text.
