@@ -6,11 +6,11 @@ Tested on LM Studio >= `0.4.21+2`.
 
 ## Background
 
-LM Studio downloads models over a **single HTTP connection**. On unstable networks this means:
+LM Studio's built-in downloader has several limitations:
 
-- Slow throughput (no parallelism, no CDN range exploitation)
-- Frequent connection drops that stall or kill the download
-- Orphaned `downloading_*.part` files that waste gigabytes when a job is cancelled
+- Downloads tend to disconnect on unstable networks, without automatic retries.
+- Downloads use at most **3 threads**, which can leave available bandwidth underutilized.
+- Download settings offer limited flexibility for customization.
 
 Since LM Studio's model files are plain HTTPS objects served by Hugging Face — which supports byte-range requests (`206 Partial Content`) — the transfer layer doesn't need LM Studio at all. `lms-mdm` reimplements the download path with segmented parallel requests, writes results into `~/.lmstudio/models/<publisher>/<repo>/`, and lets LM Studio auto-detect the finished model.
 
@@ -23,7 +23,7 @@ Since LM Studio's model files are plain HTTPS objects served by Hugging Face —
 - **Mirror endpoint support** — `--endpoint` / `$HF_ENDPOINT` swaps the API/download base URL (e.g. `https://hf-mirror.com`)
 - **Automatic capability probing** — hosts without byte-range support are detected and bypassed: segmented downloads transparently switch to the canonical Hugging Face host, falling back to single-stream as a last resort (see Limitations)
 - ♻️💾 **LM Studio partial seeding** — existing `downloading_*.part` files left behind by LM Studio are adopted as a starting offset instead of being thrown away
-- 🩹 **Stale download-job cleanup** — after downloading, optionally quits LM Studio and marks its leftover job records for this model as completed, so the model is indexed immediately instead of showing a phantom progress bar (`--fix-lms-jobs`; see [Stale download jobs](#stale-download-jobs-when-a-finished-model-still-shows-downloading))
+- 🩹 **Stale download-job cleanup** — after downloading, optionally quits LM Studio and marks its leftover job records for this model as completed, so the model is indexed immediately instead of showing a phantom progress bar (`--fix-lms-jobs`; see [Stale download jobs](#-stale-download-jobs-when-a-finished-model-still-shows-downloading))
 - **Idempotent** — already-complete files are detected by size and skipped, so re-running only fetches what's missing
 - **Inspection modes** — `--list` shows remote files vs local state; `--dry-run` previews the plan
 - **Extras** — include/exclude glob filters, optional transport-level proxy (`--proxy`), access token for gated repos (`--token` / `$HF_TOKEN`)
@@ -38,7 +38,7 @@ python3 lms_mdm.py <source> [options]
 `<source>` accepts any of:
 
 | Form | Example |
-|---|---|
+| --- | --- |
 | Repo id | `lmstudio-community/Qwen3.8-27B-MLX-8bit` |
 | Hugging Face URL | `https://huggingface.co/publisher/repo` |
 | Direct file URL | `https://huggingface.co/pub/repo/resolve/main/model.gguf` |
@@ -78,7 +78,7 @@ python3 lms_mdm.py publisher/repo --proxy http://127.0.0.1:7890
 | `--include` / `--exclude` | – | Glob patterns, repeatable |
 | `--no-resume` | off | Ignore saved segment state |
 | `--no-seed` | off | Don't adopt LM Studio `downloading_*.part` files |
-| `--fix-lms-jobs` | off | Post-download: quit LM Studio and mark its stale job records completed so the model indexes (see [Stale download jobs](#stale-download-jobs-when-a-finished-model-still-shows-downloading)) |
+| `--fix-lms-jobs` | off | Post-download: quit LM Studio and mark its stale job records completed so the model indexes (see [Stale download jobs](#-stale-download-jobs-when-a-finished-model-still-shows-downloading)) |
 | `--list` | – | Show files + local status, then exit |
 | `--dry-run` | – | Plan only, download nothing |
 
@@ -101,7 +101,7 @@ at some percentage.
 
 At the end of a successful run (terminal attached), `lms-mdm` prompts:
 
-```
+```bash
 Clean up stale LM Studio download jobs for this model now? (quits LM Studio; makes it index the new model) [y/N]
 ```
 
