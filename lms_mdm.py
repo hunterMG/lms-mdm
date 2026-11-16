@@ -321,6 +321,11 @@ def download_file(client: HttpClient, repo: str, entry: dict, dest_dir: str, arg
                                        args.endpoint, prog)
     url = f"{base}/{repo}/resolve/{args.revision}/{name}"
 
+    # Repo files can live in subdirectories (e.g. "draft/layer-0.bin").
+    parent = os.path.dirname(final)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     if mode == "single":
         for p in (part, state_path):
             if os.path.exists(p):
